@@ -1,14 +1,20 @@
-## O que faz: cria o módulo responsável por transformar texto em vetores — será usado em todo o pipeline de RAG.
+from openai import OpenAI
+from app.config import OPENAI_API_KEY
 
-from sentence_transformers import SentenceTransformer
+# Cliente OpenAI
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Carrega o modelo de embeddings
-model = SentenceTransformer("all-MiniLM-L6-v2")
+# Modelo de embeddings
+MODELO_EMBEDDING = "text-embedding-3-small"
+DIMENSOES = 1536
 
 def gerar_embedding(texto: str) -> list[float]:
-    """Transforma um texto em vetor de embeddings."""
-    embedding = model.encode(texto)
-    return embedding.tolist()
+    """Transforma um texto em vetor de embeddings usando OpenAI."""
+    response = client.embeddings.create(
+        input=texto,
+        model=MODELO_EMBEDDING
+    )
+    return response.data[0].embedding
 
 if __name__ == "__main__":
     texto = "Cliente quer devolver um iPhone 15 com defeito na câmera."
