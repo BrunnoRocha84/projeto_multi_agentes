@@ -1,11 +1,13 @@
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, Annotated
 import operator
+import time
 
 from app.agents.triagem import classificar_intencao
 from app.agents.faq import responder_faq
 from app.agents.pos_venda import processar_pos_venda
 from app.agents.escalada import processar_escalada, deve_escalar
+from app.observability.langfuse_client import registrar_atendimento
 
 # ─────────────────────────────────────────
 # ESTADO DO GRAFO
@@ -18,6 +20,10 @@ class EstadoAtendimento(TypedDict):
     protocolo: str
     escalado: bool
     tentativas: int
+    tokens_usados: int
+    latencia_ms: int
+    fontes: list
+    usuario_id: str
 
 # ─────────────────────────────────────────
 # NÓS DO GRAFO
@@ -30,22 +36,30 @@ def no_triagem(estado: EstadoAtendimento) -> dict:
 
 def no_faq(estado: EstadoAtendimento) -> dict:
     """Nó 2: Responde dúvidas com RAG."""
+    inicio = time.time()
     resultado = responder_faq(estado["mensagem"], estado["historico"])
-    print(f"[FAQ] Tokens: {resultado['tokens_usados']}")
+    latencia = int((time.time() - inicio) * 1000)
+    print(f"[FAQ] Tokens: {resultado['tokens_usados']} | Latência: {latencia}ms")
     return {
         "resposta": resultado["resposta"],
-        "historico": resultado["historico"]
+        "historico": resultado["historico"],
+        "tokens_usados": resultado["tokens_usados"],
+        "latencia_ms": latencia,
+        "fontes": resultado.get("fontes", [])
     }
 
 def no_pos_venda(estado: EstadoAtendimento) -> dict:
     """Nó 3: Processa trocas e devoluções."""
+    inicio = time.time()
     resultado = processar_pos_venda(estado["mensagem"], estado["historico"])
-    print(f"[Pós-Venda] Protocolo: {resultado.get('protocolo')}")
+    latencia = int((time.time() - inicio) * 1000)
+    print(f"[Pós-Venda] Protocolo: {resultado.get('protocolo')} | Latência: {latencia}ms")
     return {
         "resposta": resultado["resposta"],
         "protocolo": resultado.get("protocolo", ""),
         "escalado": resultado.get("escalar_humano", False),
-        "historico": resultado["historico"]
+        "historico": resultado["historico"],
+        "latencia_ms": latencia
     }
 
 def no_escalada(estado: EstadoAtendimento) -> dict:
@@ -56,7 +70,7 @@ def no_escalada(estado: EstadoAtendimento) -> dict:
         intencao=estado["intencao"],
         protocolo=estado.get("protocolo")
     )
-    print(f"[Escalada] Transferindo para humano")
+    print("[Escalada] Transferindo para humano")
     return {
         "resposta": resultado["resposta"],
         "escalado": True,
@@ -65,17 +79,38 @@ def no_escalada(estado: EstadoAtendimento) -> dict:
 
 def no_saudacao(estado: EstadoAtendimento) -> dict:
     """Nó 5: Responde saudações."""
+    resposta = "Olá! Bem-vindo ao atendimento da MultiTech! 😊 Como posso ajudá-lo hoje?"
     return {
-        "resposta": "Olá! Bem-vindo ao atendimento da MultiTech! 😊 Como posso ajudá-lo hoje?",
-        "historico": [{"role": "assistant", "content": "Olá! Bem-vindo ao atendimento da MultiTech! 😊 Como posso ajudá-lo hoje?"}]
+        "resposta": resposta,
+        "historico": [{"role": "assistant", "content": resposta}]
     }
 
 def no_encerramento(estado: EstadoAtendimento) -> dict:
     """Nó 6: Encerra o atendimento."""
+    resposta = "Foi um prazer ajudá-lo! Qualquer dúvida, estamos disponíveis 24h. Tenha um ótimo dia! 👋"
     return {
-        "resposta": "Foi um prazer ajudá-lo! Qualquer dúvida, estamos disponíveis 24h. Tenha um ótimo dia! 👋",
-        "historico": [{"role": "assistant", "content": "Foi um prazer ajudá-lo!"}]
+        "resposta": resposta,
+        "historico": [{"role": "assistant", "content": resposta}]
     }
+
+def no_observabilidade(estado: EstadoAtendimento) -> dict:
+    """Nó 7: Registra o atendimento no Langfuse."""
+    try:
+        trace_id = registrar_atendimento(
+            nome="atendimento-multitech",
+            usuario_id=estado.get("usuario_id", "anonimo"),
+            mensagem=estado["mensagem"],
+            resposta=estado["resposta"],
+            intencao=estado["intencao"],
+            tokens=estado.get("tokens_usados", 0),
+            latencia_ms=estado.get("latencia_ms", 0),
+            escalado=estado.get("escalado", False),
+            fontes=estado.get("fontes", [])
+        )
+        print(f"[Langfuse] Trace registrado: {trace_id}")
+    except Exception as e:
+        print(f"[Langfuse] Erro ao registrar trace: {e}")
+    return {}
 
 # ─────────────────────────────────────────
 # ROTEADOR
@@ -101,18 +136,16 @@ def rotear(estado: EstadoAtendimento) -> str:
 def criar_grafo():
     grafo = StateGraph(EstadoAtendimento)
 
-    # Adiciona nós
     grafo.add_node("triagem", no_triagem)
     grafo.add_node("faq", no_faq)
     grafo.add_node("pos_venda", no_pos_venda)
     grafo.add_node("escalada", no_escalada)
     grafo.add_node("saudacao", no_saudacao)
     grafo.add_node("encerramento", no_encerramento)
+    grafo.add_node("observabilidade", no_observabilidade)
 
-    # Ponto de entrada
     grafo.set_entry_point("triagem")
 
-    # Roteamento condicional após triagem
     grafo.add_conditional_edges(
         "triagem",
         rotear,
@@ -125,12 +158,11 @@ def criar_grafo():
         }
     )
 
-    # Todos os nós terminam no END
-    grafo.add_edge("faq", END)
-    grafo.add_edge("pos_venda", END)
-    grafo.add_edge("escalada", END)
-    grafo.add_edge("saudacao", END)
-    grafo.add_edge("encerramento", END)
+    # Todos os agentes passam pelo nó de observabilidade antes de terminar
+    for no in ["faq", "pos_venda", "escalada", "saudacao", "encerramento"]:
+        grafo.add_edge(no, "observabilidade")
+
+    grafo.add_edge("observabilidade", END)
 
     return grafo.compile()
 
@@ -139,7 +171,7 @@ def criar_grafo():
 # ─────────────────────────────────────────
 app_grafo = criar_grafo()
 
-def atender(mensagem: str, historico: list[dict] = None) -> dict:
+def atender(mensagem: str, historico: list[dict] = None, usuario_id: str = "anonimo") -> dict:
     """Função principal de atendimento via grafo multi-agentes."""
     estado_inicial = {
         "mensagem": mensagem,
@@ -148,30 +180,29 @@ def atender(mensagem: str, historico: list[dict] = None) -> dict:
         "resposta": "",
         "protocolo": "",
         "escalado": False,
-        "tentativas": 0
+        "tentativas": 0,
+        "tokens_usados": 0,
+        "latencia_ms": 0,
+        "fontes": [],
+        "usuario_id": usuario_id
     }
     return app_grafo.invoke(estado_inicial)
 
 if __name__ == "__main__":
-    print("MultiTech — Sistema Multi-Agentes\n")
+    print("MultiTech — Sistema Multi-Agentes com Observabilidade\n")
     print("=" * 60)
 
     cenarios = [
         "Oi, boa tarde!",
-        "Quero devolver meu smartphone com defeito",
         "Qual o prazo de entrega para Belo Horizonte?",
-        "Preciso falar com um atendente humano",
+        "Quero devolver meu smartphone com defeito",
         "Obrigado, tchau!"
     ]
 
     historico = []
     for mensagem in cenarios:
         print(f"\nCliente: {mensagem}")
-        resultado = atender(mensagem, historico)
+        resultado = atender(mensagem, historico, usuario_id="cliente-123")
         historico = resultado.get("historico", historico)
-        print(f"Agente: {resultado['resposta']}")
-        if resultado.get("protocolo"):
-            print(f"Protocolo: {resultado['protocolo']}")
-        if resultado.get("escalado"):
-            print("⚠️  ESCALADO PARA HUMANO")
+        print(f"Agente: {resultado['resposta'][:150]}...")
         print("-" * 60)
