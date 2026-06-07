@@ -1,8 +1,8 @@
-## O que faz: cria o servidor FastAPI que vai expor o sistema multi-agentes como uma API REST — o ponto de entrada para qualquer canal (web, WhatsApp, app mobile).
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
+from contextlib import asynccontextmanager
 import time
 
 from app.agents.orquestrador import atender
@@ -13,15 +13,27 @@ from app.observability.metrics import (
 )
 
 # ─────────────────────────────────────────
+# LIFESPAN — pré-carrega modelos pesados
+# ─────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("[API] Pré-carregando modelos...")
+    from app.rag.reranker import get_model
+    get_model()
+    print("[API] Modelos prontos.")
+    yield
+    print("[API] Encerrando...")
+
+# ─────────────────────────────────────────
 # APP FASTAPI
 # ─────────────────────────────────────────
 app = FastAPI(
     title="MultiTech — API de Atendimento",
     description="Sistema multi-agentes de atendimento ao cliente com RAG",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
-# CORS — permite acesso de qualquer origem
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -51,7 +63,6 @@ class AtendimentoResponse(BaseModel):
 # ─────────────────────────────────────────
 @app.get("/")
 def health_check():
-    """Health check da API."""
     return {
         "status": "online",
         "servico": "MultiTech Atendimento",
@@ -60,7 +71,6 @@ def health_check():
 
 @app.get("/health")
 def health():
-    """Health check detalhado."""
     return {
         "status": "healthy",
         "componentes": {
@@ -77,12 +87,10 @@ def endpoint_atender(request: MensagemRequest):
     if not request.mensagem.strip():
         raise HTTPException(status_code=400, detail="Mensagem não pode ser vazia")
 
-    # Registra atendimento ativo
     atendimentos_ativos.inc()
     inicio = time.time()
 
     try:
-        # Chama o orquestrador
         resultado = atender(
             mensagem=request.mensagem,
             historico=request.historico,
@@ -91,7 +99,6 @@ def endpoint_atender(request: MensagemRequest):
 
         latencia = int((time.time() - inicio) * 1000)
 
-        # Registra métricas
         registrar_atendimento_metrica(
             intencao=resultado.get("intencao", "Duvida_Geral"),
             escalado=resultado.get("escalado", False),
@@ -118,10 +125,8 @@ def endpoint_atender(request: MensagemRequest):
 
 @app.get("/metricas/resumo")
 def resumo_metricas():
-    """Resumo das métricas do sistema."""
     return {
         "status": "online",
         "metricas_url": "http://localhost:8001/metrics",
         "grafana_url": "http://localhost:3000"
     }
-    
